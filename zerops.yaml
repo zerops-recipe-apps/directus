@@ -127,7 +127,7 @@ zerops:
       readinessCheck:
         httpGet:
           port: 8055
-          path: /server/health
+          path: /server/ping
         # failureTimeout and retryPeriod are intentionally omitted.
         # The Zerops runtime rejects integer values (!!int → time.Duration error)
         # and strips unit suffixes from strings before unmarshaling, causing the
@@ -162,7 +162,7 @@ zerops:
       healthCheck:
         httpGet:
           port: 8055
-          path: /server/health
+          path: /server/ping
 
   # ── production ────────────────────────────────────────────────────────────
   # Multi-container HA production environment. minContainers ≥ 2 in import.yaml
@@ -196,7 +196,7 @@ zerops:
       readinessCheck:
         httpGet:
           port: 8055
-          path: /server/health
+          path: /server/ping
 
     run:
       # SEED_VERSION is intentionally absent from this run block.
@@ -218,7 +218,7 @@ zerops:
       healthCheck:
         httpGet:
           port: 8055
-          path: /server/health
+          path: /server/ping
 
   # ── directus ──────────────────────────────────────────────────────────────
   # Hostname-matched alias for production. When a service's hostname is `directus`
