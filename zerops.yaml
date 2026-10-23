@@ -49,7 +49,9 @@ zerops:
 
         # ── Cache & synchronisation (Valkey) ─────────────────────────────────
         REDIS_HOST: ${cache_hostname}
-        REDIS_PORT: "6379"
+        REDIS_PORT: ${cache_port}
+        # Valkey on Zerops requires AUTH — without this, bootstrap fails with NOAUTH.
+        REDIS_PASSWORD: ${cache_password}
         # SYNCHRONIZATION_STORE broadcasts schema cache invalidations, rate-limit
         # counters, and auth-token blacklists across all containers in HA deployments.
         # Safe and effectively a no-op in single-container dev.
