@@ -1,0 +1,323 @@
+# Zerops × Directus
+
+![Zerops × Directus](data/images/cover-directus.webp)
+
+[Directus](https://directus.io) is an open-source headless CMS and data platform that wraps any SQL database with a powerful REST & GraphQL API, a rich Data Studio UI, and a flexible roles & permissions system. This recipe deploys a fully production-ready Directus instance on [Zerops](https://zerops.io) with zero manual setup.
+
+[![Deploy on Zerops](https://github.com/zeropsio/recipe-shared-assets/blob/main/deploy-button/green/deploy-button.svg)](https://app.zerops.io/recipes/directus)
+
+&nbsp;
+
+---
+
+<!-- #ZEROPS_EXTRACT_START:intro# -->
+
+Zerops recipe app for [Directus](https://directus.io) 12 — production-ready headless CMS on Node.js 24 with PostgreSQL 16, Valkey 7.2 cache, S3-compatible object storage, and Mailpit for development email. Imports live in [zeropsio/recipes/directus](https://github.com/zeropsio/recipes/tree/main/directus). Demo schema and seeded content ship with the repo.
+
+<!-- #ZEROPS_EXTRACT_END:intro# -->
+
+&nbsp;
+
+---
+
+<!-- #ZEROPS_EXTRACT_START:integration-guide# -->
+
+## Architecture
+
+```
+Browser / API clients
+        ↓
+  Directus 12 (Node.js 24)
+    ├── PostgreSQL 16   ← primary datastore         (HA in production)
+    ├── Valkey 7.2      ← cache + pub/sub sync       (HA in production)
+    ├── Object Storage  ← S3-compatible file uploads (persistent)
+    └── Mailpit         ← SMTP sink for dev email    (development only)
+```
+
+&nbsp;
+
+## Services
+
+| Service    | Type                    | Dev         | Production                 |
+| ---------- | ----------------------- | ----------- | -------------------------- |
+| `directus` | Alpine Node.js 24       | 1 container | 2–6 containers (autoscale) |
+| `db`       | PostgreSQL 16           | NON_HA      | HA (3-node cluster)        |
+| `cache`    | Valkey 7.2              | NON_HA      | HA                         |
+| `storage`  | Object Storage          | 10 GB       | 50 GB                      |
+| `mailpit`  | Mailpit                 | ✓ included  | ✗ use real SMTP            |
+
+&nbsp;
+
+## Repository layout
+
+```
+.
+├── data/
+│   ├── data.json                       ← seed content (categories, authors, posts, dashboard)
+│   ├── images/                         ← post cover images and author avatars
+│   └── uploads/                        ← site-wide assets (cover image)
+├── database/
+│   └── snapshot.yaml                   ← Directus schema snapshot (collections, fields, relations)
+├── extensions/
+│   └── directus-extension-seed-demo/   ← auto-healing demo content seeder
+│       ├── index.js                    ← server.start hook; Knex-direct insert into empty tables
+│       └── package.json                ← Directus extension manifest
+├── scripts/
+│   └── ensure-schema.mjs               ← idempotent schema apply; skips if DB already seeded
+├── .npmrc
+├── AGENTS.md
+├── package.json
+└── zerops.yaml                         ← build + run pipeline (`base`, `development`, `production`, `directus` setups)
+```
+
+> Recipe `import.yaml` files live in [zeropsio/recipes/directus](https://github.com/zeropsio/recipes/tree/main/directus), not in this app repo (same pattern as [zerops-recipe-apps/strapi](https://github.com/zerops-recipe-apps/strapi)).
+
+&nbsp;
+
+## Deployment flow
+
+A single `zerops.yaml` drives every environment via four setups (`base`, `development`, `production`, `directus`). Two `initCommands` run before the HTTP server starts, each wrapped in `zsc execOnce` so multi-container deploys execute exactly once. Demo content is then seeded by a Directus extension hook the first time the server reaches `server.start`:
+
+| Step | Command / hook                                                    | Idempotent via                                               |
+| ---- | ----------------------------------------------------------------- | ------------------------------------------------------------ |
+| 1    | `directus bootstrap`                                              | `Database already initialized, skipping install`             |
+| 2    | `node scripts/ensure-schema.mjs`                                  | `hasTable('categories')` DB check — skips on existing DBs    |
+| 3    | `directus start` (foreground)                                     | —                                                            |
+| 4    | `extensions/directus-extension-seed-demo` fires on `server.start` | `seed_runs` table keyed on `SEED_VERSION` env var            |
+
+```
+1. directus bootstrap
+   └── Creates all Directus system tables
+   └── Creates the first admin user from ADMIN_EMAIL + ADMIN_PASSWORD
+
+2. node scripts/ensure-schema.mjs
+   └── Checks if `categories` table exists in the database
+   └── Fresh DB  → calls `directus schema apply --yes ./database/snapshot.yaml`
+        └── Creates collections: categories, authors, posts + all fields, relations, display settings
+        └── CLI auto-detected: node_modules/.bin/directus (Zerops) or node cli.js (Docker official image)
+   └── Existing DB → skips schema apply entirely (data-safe guard — never destroys content)
+
+3. directus start
+   └── Launches the HTTP server on port 8055
+
+4. extensions/directus-extension-seed-demo (fires on server.start)
+   ├── Skips entirely if SEED_VERSION is not set (production safety guard)
+   ├── Skips entirely if this SEED_VERSION is already recorded in seed_runs
+   ├── Uploads seed images to object storage via FilesService (idempotent per filename)
+   ├── Patches the admin user profile (avatar, title, location, description, tags)
+   └── In one transaction:
+        ├── For each collection: INSERT only missing seed rows (keyed on fixed UUIDs)
+        ├── Inserts the Insights dashboard and panels into directus_dashboards / directus_panels
+        └── Records SEED_VERSION in seed_runs (commit = seed complete)
+```
+
+**Why an extension hook instead of a one-shot migration?** The Directus migration system records "done" exactly once in `directus_migrations`, which is correct for schema changes but wrong for a _seed_: if anyone deletes rows in the Data Studio, a migration-based seeder leaves the table empty forever. The hook checks a `seed_runs` table keyed on `SEED_VERSION` — bump the version to re-seed on the next deploy without touching schema migrations.
+
+**SEED_VERSION control:**
+
+| `SEED_VERSION` value | Behaviour |
+| -------------------- | --------- |
+| Not set (unset)      | Hook skips — safe default for production envs with real data |
+| `"1.0.0"` (already in `seed_runs`) | Hook skips — content already seeded |
+| `"1.0.1"` (new value) | Hook runs the full seed on next container start |
+
+**Recovery: deleted rows vs deleted collections.**
+
+| What you deleted | How to restore |
+| ---------------- | -------------- |
+| **Rows** inside a collection | Bump `SEED_VERSION` on the service and redeploy |
+| **A whole collection** | Restore from DB backup or re-import a fresh project — schema apply is guarded on non-empty databases |
+
+&nbsp;
+
+## Demo content
+
+The seed creates a fully populated CMS on first deploy:
+
+**Categories:** Technology · DevOps · Tutorials
+
+**Authors:** Alex Petrov · Maria Chen (each with avatar, bio, email)
+
+**Posts (3 published, 1 draft):**
+| Title | Status | Category |
+|-------|--------|----------|
+| Getting Started with Directus on Zerops | published | Tutorials |
+| Why We Chose Valkey Over Redis | published | Technology |
+| Object Storage Deep Dive: S3 on Zerops | published | DevOps |
+| High-Availability PostgreSQL on Zerops | draft | DevOps |
+
+**Files (uploaded to object storage):** cover image, 4 post cover images, 3 author avatars — each with title, description, and tags.
+
+**Admin profile:** avatar, title, location, description, and tags patched on the `admin@example.com` user.
+
+**Insights dashboard:** "Content Overview" with 5 metric panels — All Posts, Published, Drafts, Authors, Categories.
+
+&nbsp;
+
+## Secrets & environment variables
+
+These secrets are **randomly generated at import time** and never stored in source code:
+
+| Variable         | Length   | Purpose                                                           |
+| ---------------- | -------- | ----------------------------------------------------------------- |
+| `SECRET`         | 64 chars | Signs all Directus JWTs and cookies — rotating logs out all users |
+| `ADMIN_PASSWORD` | 20 chars | Initial admin account password                                    |
+| `ADMIN_TOKEN`    | 40 chars | Static API token for the seed script, CI/CD, and automation       |
+
+All other environment variables are declared in `zerops.yaml` under `envVariables`. Key ones:
+
+| Variable                      | Value     | Why                                               |
+| ----------------------------- | --------- | ------------------------------------------------- |
+| `ACCEPT_TERMS`                | `"true"`  | Required to acknowledge Directus BSL 1.1 licence  |
+| `TELEMETRY`                   | `"false"` | Disables anonymous usage stats                    |
+| `SYNCHRONIZATION_STORE`       | `redis`   | Enables Valkey-backed sync across containers      |
+| `STORAGE_S3_FORCE_PATH_STYLE` | `"true"`  | Required for custom S3 endpoints (Zerops / MinIO) |
+| `RATE_LIMITER_ENABLED`        | `"true"`  | Protects `/auth/login` from brute-force attacks   |
+| `RATE_LIMITER_STORE`          | `redis`   | Shares rate-limit counters across all containers  |
+| `PUBLIC_URL`                  | `${zeropsSubdomain}` | Auto-resolved to your Zerops subdomain — update if you connect a custom domain |
+
+&nbsp;
+
+## After first deploy
+
+1. **Retrieve your admin credentials** — go to Zerops GUI → `directus` service → Environment Variables → Secret Variables → reveal `ADMIN_PASSWORD` and `ADMIN_TOKEN`.
+
+2. **Log in** at your service's subdomain URL with `admin@example.com` and the revealed password.
+
+3. **`PUBLIC_URL` is pre-configured** — it is automatically set to `${zeropsSubdomain}`, which Zerops resolves to your service's subdomain URL at deploy time. No manual step required. If you connect a custom domain, update `PUBLIC_URL` to the custom domain and trigger a re-deploy.
+
+4. **Change the admin email** — in the Data Studio, go to User Directory → Administrator and update the email to a real address.
+
+&nbsp;
+
+## Multi-container / HA requirements
+
+`SYNCHRONIZATION_STORE=redis` is set unconditionally in `zerops.yaml`. Directus uses it to broadcast across all running containers:
+
+- **Schema cache invalidations** — prevents stale-schema bugs when one container applies a migration
+- **Rate-limit counters** — ensures limits aren't bypassed by hitting different containers
+- **Auth token blacklists** — ensures logout is respected by all containers immediately
+
+This setting is harmless in single-container development and essential in multi-container production.
+
+The Production recipe sets `minContainers: 2` to guarantee **zero-downtime rolling upgrades**: Zerops starts new containers and waits for the readiness check (`GET /server/health`) to pass before terminating old ones.
+
+&nbsp;
+
+## Object storage
+
+Directus file uploads are routed to Zerops S3-compatible object storage via these env vars:
+
+```dotenv
+STORAGE_LOCATIONS=s3
+STORAGE_S3_DRIVER=s3
+STORAGE_S3_KEY=${storage_accessKeyId}
+STORAGE_S3_SECRET=${storage_secretAccessKey}
+STORAGE_S3_BUCKET=${storage_bucketName}
+STORAGE_S3_ENDPOINT=${storage_apiUrl}
+STORAGE_S3_REGION=us-east-1
+STORAGE_S3_FORCE_PATH_STYLE=true
+STORAGE_S3_ACL=public-read
+```
+
+`FORCE_PATH_STYLE=true` is required because Zerops object storage uses a single endpoint host — the bucket name must be in the URL path (`/bucket/key`) rather than the hostname (`bucket.host`). `public-read` makes uploaded files accessible without signed URLs, which is required for the Directus `/assets` endpoint and Data Studio image previews.
+
+&nbsp;
+
+## Email
+
+**Development** — all outbound email is captured by the **Mailpit** service. Open the Mailpit web UI (port `8025`) via the service subdomain to inspect messages. No real email is ever sent.
+
+**Production** — configure your SMTP provider by adding these env vars in the Zerops GUI:
+
+```
+EMAIL_TRANSPORT         smtp
+EMAIL_SMTP_HOST         smtp.sendgrid.net
+EMAIL_SMTP_PORT         587
+DIRECTUS_EMAIL_FROM     no-reply@yourdomain.com
+```
+
+`DIRECTUS_EMAIL_FROM` overrides the default `EMAIL_FROM` fallback (`no-reply@example.com`) declared in `zerops.yaml`.
+
+Add `EMAIL_SMTP_USER` and `EMAIL_SMTP_PASSWORD` as env **secrets**.
+
+<!-- #ZEROPS_EXTRACT_END:integration-guide# -->
+
+&nbsp;
+
+---
+
+<!-- #ZEROPS_EXTRACT_START:maintenance-guide# -->
+
+## Local development
+
+Use a Zerops project — no Docker in this repository:
+
+1. Import [directus](https://app.zerops.io/recipes/directus) (**Local** or **Remote (CDE)**).
+2. Open the `directus` service subdomain and reveal `ADMIN_PASSWORD` / `ADMIN_TOKEN` in the GUI.
+
+`.env.example` documents variable names for reference; on Zerops they are set via vault and `zerops.yaml`.
+
+&nbsp;
+
+## Upgrade Directus
+
+1. Pin `directus` in `package.json` (exact version).
+2. Run `npm install`, `npm audit --audit-level=high`, and verify `directus --version` after native rebuild steps.
+3. Push — Zerops runs `npm ci`, rebuilds native modules, and rolling-restarts the service.
+
+`directus bootstrap` in `initCommands` applies built-in migrations on each deploy version.
+
+&nbsp;
+
+## Update the schema
+
+If you extend the schema (new collections, fields, relations):
+
+1. Change schema in the Data Studio on your Zerops project (or export from another instance).
+2. Export a snapshot into `database/snapshot.yaml` (`npm run schema:snapshot` against a configured instance).
+3. Commit `database/snapshot.yaml`.
+4. In `zerops.yaml`, increment the `execOnce` key for `ensure-schema.mjs`:
+   ```yaml
+   - zsc execOnce "schema-cms-v2" -- node scripts/ensure-schema.mjs
+   ```
+   > **Why?** `ensure-schema.mjs` guards against re-applying the snapshot on an existing database by checking whether the `categories` table already exists. Bumping the execOnce key alone is not enough — the `hasTable` guard will still skip on a populated database. Schema changes on an existing production instance should be applied via the Directus CLI or the Admin UI, and the snapshot committed to keep source control in sync.
+5. Push — the updated snapshot is deployed with the next build.
+
+&nbsp;
+
+## Retrieve admin credentials
+
+The `ADMIN_PASSWORD` and `ADMIN_TOKEN` are auto-generated at import time:
+
+1. Zerops GUI → your project → `directus` service.
+2. **Environment Variables** → **Secret Variables**.
+3. Reveal `ADMIN_PASSWORD` and `ADMIN_TOKEN`.
+
+&nbsp;
+
+## Scale the Directus service
+
+**Horizontal** — update `minContainers` / `maxContainers` on the `directus` service in the Zerops GUI, or edit the import YAML and re-import.
+
+**Vertical** — Zerops autoscales RAM and CPU within the bounds set in `verticalAutoscaling` (default: 1–16 GB RAM, 1–8 vCPU in production).
+
+&nbsp;
+
+## Back up the database
+
+Database backups can be configured in the `db` service settings in the Zerops GUI (daily snapshots available on paid plans). To restore a backup, follow the [Zerops database restore guide](https://docs.zerops.io).
+
+<!-- #ZEROPS_EXTRACT_END:maintenance-guide# -->
+
+&nbsp;
+
+---
+
+Need help? Join the [Zerops Discord community](https://discord.gg/zeropsio).
+
+&nbsp;
+
+---
+
+**Maintainer:** [Zerops recipe apps](https://github.com/zerops-recipe-apps)

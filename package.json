@@ -1,0 +1,46 @@
+{
+  "name": "directus",
+  "version": "1.0.0",
+  "description": "Directus headless CMS on Zerops with PostgreSQL, Valkey, S3 object storage, and idempotent demo seeding.",
+  "author": "Zerops",
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zerops-recipe-apps/directus.git"
+  },
+  "homepage": "https://app.zerops.io/recipes/directus",
+  "bugs": {
+    "url": "https://github.com/zerops-recipe-apps/directus/issues"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "keywords": [
+    "directus",
+    "zerops",
+    "cms",
+    "headless",
+    "postgresql",
+    "valkey",
+    "s3",
+    "nodejs"
+  ],
+  "scripts": {
+    "start": "directus start",
+    "bootstrap": "directus bootstrap",
+    "schema:snapshot": "directus schema snapshot ./database/snapshot.yaml",
+    "schema:apply:unsafe": "directus schema apply --yes ./database/snapshot.yaml"
+  },
+  "dependencies": {
+    "directus": "12.5.0"
+  },
+  "overrides": {
+    "isolated-vm": "7.0.1"
+  },
+  "allowScripts": {
+    "isolated-vm@7.0.1": true,
+    "argon2@0.44.0": true,
+    "esbuild@0.28.1": true
+  }
+}
